@@ -16,20 +16,21 @@ This implementation follows the algorithm presented in Mukherjee et al. (2006).[
 """
 mutable struct Ellipsoid{T} <: AbstractBoundingSpace{T}
     center::Vector{T}
-    A::Matrix{T}
+    A::Symmetric{T, Matrix{T}}
     axes::Matrix{T}
     axlens::Vector{T}
     volume::T
 end
 
 
-function Ellipsoid(center::AbstractVector, A::AbstractMatrix)
+Ellipsoid(center::AbstractVector, A::AbstractMatrix) = Ellipsoid(center, Symmetric(A))
+function Ellipsoid(center::AbstractVector, A::Symmetric)
     axes, axlens = decompose(A)
     Ellipsoid(center, A, axes, axlens, _volume(A))
 end
 Ellipsoid(ndim::Integer) = Ellipsoid(Float64, ndim)
 Ellipsoid(T::Type, ndim::Integer) = Ellipsoid(zeros(T, ndim), diagm(0 => ones(T, ndim)))
-Ellipsoid{T}(center::AbstractVector, A::AbstractMatrix) where {T} = Ellipsoid(T.(center), T.(A))
+Ellipsoid{T}(center::AbstractVector, A::AbstractMatrix) where {T} = Ellipsoid(convert(AbstractVector{T}, center), convert(AbstractMatrix{T}, A))
 
 Base.broadcastable(e::Ellipsoid) = (e,)
 
@@ -41,8 +42,6 @@ volume(ell::Ellipsoid) = ell.volume
 
 # Returns the principal axes
 axes(ell::Ellipsoid) = ell.axes
-
-decompose(A::AbstractMatrix) = decompose(Symmetric(A))  # ensure that eigen() always returns real values
 
 function decompose(A::Symmetric)
     E = eigen(A)
@@ -58,7 +57,7 @@ decompose(ell::Ellipsoid) = ell.axes, ell.axlens
 function scale!(ell::Ellipsoid, factor)
     # linear factor
     f = factor^(1 / ndims(ell))
-    ell.A ./= f^2
+    ell.A /= f^2
     ell.axes .*= f
     ell.axlens .*= f
     ell.volume *= factor
@@ -96,16 +95,12 @@ function fit(E::Type{<:Ellipsoid{R}}, x::AbstractMatrix{S}; pointvol = 0) where 
         return Ellipsoid(vec(x), A)
     end
     # get estimators
-    center, cov = mean_and_cov(x, 2)
+    center, cov_ = mean_and_cov(x, 2)
     delta = x .- center
     # Covariance is smaller than r^2 by a factor of 1/(n+2)
-    cov .*= ndim + 2
-    # Ensure cov is nonsingular
-    targetprod = (npoints * pointvol / volume_prefactor(ndim))^2
-    make_eigvals_positive!(cov, targetprod)
-
-    # get transformation matrix. Note: use pinv to avoid error when cov is all zeros
-    A = pinv(cov)
+    cov = Symmetric(cov_) * (ndim + 2)
+    # ensure cov is posdef and get transformation matrix
+    cov, A = make_eigvals_positive(cov)
 
     # calculate expansion factor necessary to bound each points
     f = diag(delta' * (A * delta))
@@ -115,7 +110,7 @@ function fit(E::Type{<:Ellipsoid{R}}, x::AbstractMatrix{S}; pointvol = 0) where 
     # x^T A x < 1 - √eps
     flex = 1 - sqrt(eps(T))
     if fmax > flex
-        A .*= flex / fmax
+        A *= flex / fmax
     end
 
     ell = E(vec(center), A)
@@ -165,16 +160,13 @@ function randball(rng::AbstractRNG, T::Type, D::Integer)
     return z
 end
 
-function make_eigvals_positive!(cov::AbstractMatrix, targetprod)
+function make_eigvals_positive(cov::Symmetric)
     E = eigen(cov)
-    mask = E.values .< 1e-10
-    if any(mask)
-        nzprod = prod(E.values[.!mask])
-        nzeros = count(mask)
-        E.values[mask] .= (targetprod / nzprod)^(1 / nzeros)
-        cov .= E.vectors * Diagonal(E.values) / E.vectors
+    maxcond = 1e10
+    maxval = max(maximum(E.values), 1/1e10)
+    if minimum(E.values) / maxval < 1/maxcond
+        E.values .= max.(E.values, maxval / maxcond)
+        return Symmetric(Matrix(E)), Symmetric(inv(E))
     end
-    return cov
+    return cov, Symmetric(inv(E))
 end
-
-make_eigvals_positive(cov::AbstractMatrix, targetprod) = make_eigvals_positive!(copy(cov), targetprod)
